@@ -251,15 +251,110 @@ EOF
 main() {
   require_root
   parse_args "$@"
-  ensure_user
-  configure_passwordless_sudo
-  install_ssh_key
-  configure_ssh_hardening
-  deny_root_console_login
-  configure_console_only_adm01
-  configure_console_autologoff_tmout
-  optional_disable_wait_online
+  # ensure_user
+  # configure_passwordless_sudo
+  # install_ssh_key
+  smart_configure_ssh_hardening
+  smart_deny_root_console_login
+  smart_configure_console_only_adm01
+  smart_configure_console_autologoff_tmout
+  smart_optional_disable_wait_online
   final_checks
 }
 
-main "$@"
+# Smart SSH hardening: only change if needed
+smart_configure_ssh_hardening() {
+  local f="/etc/ssh/sshd_config"
+  local needed=0
+  grep -q '^PasswordAuthentication no' "$f" || needed=1
+  grep -q '^KbdInteractiveAuthentication no' "$f" || needed=1
+  grep -q '^ChallengeResponseAuthentication no' "$f" || needed=1
+  grep -q '^PermitRootLogin no' "$f" || needed=1
+  grep -q '^PubkeyAuthentication yes' "$f" || needed=1
+  grep -q '^UsePAM yes' "$f" || needed=1
+  if [ "$needed" -eq 0 ]; then
+    log "SSH config already hardened."
+    return
+  fi
+  backup_file "$f"
+  log "Hardening SSH (no passwords; no root login)"
+  set_sshd_kv "PasswordAuthentication" "no"
+  set_sshd_kv "KbdInteractiveAuthentication" "no"
+  set_sshd_kv "ChallengeResponseAuthentication" "no"
+  set_sshd_kv "PermitRootLogin" "no"
+  set_sshd_kv "PubkeyAuthentication" "yes"
+  set_sshd_kv "UsePAM" "yes"
+  sshd -t || die "sshd_config validation failed. Fix /etc/ssh/sshd_config."
+  systemctl reload ssh || systemctl reload sshd
+  log "SSH reloaded"
+}
+
+# Smart deny root console login
+smart_deny_root_console_login() {
+  local f="/etc/securetty"
+  if [ ! -s "$f" ]; then
+    log "Root console login already denied."
+    return
+  fi
+  backup_file "$f"
+  log "Denying root login on console (empty /etc/securetty)"
+  : >"$f"
+}
+
+# Smart restrict console login to adm-01
+smart_configure_console_only_adm01() {
+  ensure_pam_access_enabled
+  local f="/etc/security/access.conf"
+  if grep -q "^# BEGIN ADM01_CONSOLE_ONLY$" "$f" && grep -q "^# END ADM01_CONSOLE_ONLY$" "$f"; then
+    log "Console login restriction already set for ${ADM_USER}."
+    return
+  fi
+  backup_file "$f"
+  log "Restricting console login: allow ${ADM_USER} only; deny everyone else (LOCAL)"
+  sed -i '/^# BEGIN ADM01_CONSOLE_ONLY$/,/^# END ADM01_CONSOLE_ONLY$/d' "$f" || true
+  cat >>"$f" <<EOF
+
+# BEGIN ADM01_CONSOLE_ONLY
+# Allow adm-01 on local console
++ : ${ADM_USER} : LOCAL
+# Deny everyone else on console
+- : ALL : LOCAL
+# END ADM01_CONSOLE_ONLY
+EOF
+}
+
+# Smart auto-logout idle shells
+smart_configure_console_autologoff_tmout() {
+  local f="/etc/profile.d/00-autologout.sh"
+  if [ -f "$f" ] && grep -q "TMOUT=${TMOUT_SECONDS}" "$f"; then
+    log "Auto-logoff already set to ${TMOUT_SECONDS}s."
+    return
+  fi
+  log "Configuring console idle auto-logoff (TMOUT=${TMOUT_SECONDS}s): $f"
+  cat >"$f" <<EOF
+# Auto-logout idle interactive shells (console/tty) after ${TMOUT_SECONDS}s.
+# Applies to bash/sh for interactive shells.
+case "\$-" in
+  *i*)
+    TMOUT=${TMOUT_SECONDS}
+    readonly TMOUT
+    export TMOUT
+  ;;
+esac
+EOF
+  chmod 0644 "$f"
+}
+
+# Smart optionally disable systemd-networkd-wait-online
+smart_optional_disable_wait_online() {
+  if [[ "$DISABLE_WAIT_ONLINE" == "yes" ]]; then
+    if ! systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null | grep -q 'enabled'; then
+      log "systemd-networkd-wait-online already disabled."
+      return
+    fi
+    log "Disabling systemd-networkd-wait-online to avoid boot hangs"
+    systemctl disable --now systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+  else
+    log "Leaving systemd-networkd-wait-online enabled"
+  fi
+}
