@@ -1,31 +1,28 @@
 #!/usr/bin/env bash
 # smart-hardening.sh (Ubuntu 22.04)
 #
-# WHAT THIS SCRIPT DOES:
-#   - Creates or ensures an admin user (default: adm-01, configurable)
+# WHAT THIS SCRIPT DOES (only with explicit --do-* flags):
+#   - Creates or ensures an admin user
 #   - Installs an SSH public key for that user
 #   - Configures passwordless sudo for the user
 #   - Hardens SSH: disables password/root login, enables key auth
 #   - Denies root console login
 #   - Restricts console login to the admin user only
-#   - Enables auto-logoff for idle shells (default: 10 min, configurable)
-#   - Optionally disables systemd-networkd-wait-online to prevent boot hang
+#   - Enables auto-logoff for idle shells
+#   - Optionally disables systemd-networkd-wait-online
 #
 # HOW TO USE:
 #   1. Prepare your SSH public key (e.g., id_ed25519.pub)
-#   2. Run as root with explicit parameters:
-#      sudo bash smart-hardening.sh --user <username> --pubkey "ssh-ed25519 AAAA... comment"
-#      OR
-#      sudo bash smart-hardening.sh --user <username> --pubkey-file /path/to/key.pub
-#   3. Review the summary and confirm when prompted.
+#   2. Run as root with explicit --do-* flags for each step you want:
+#      sudo bash smart-hardening.sh --user <username> --pubkey "ssh-ed25519 AAAA..." --do-ensure-user --do-passwordless-sudo --do-install-ssh-key --do-ssh-harden --do-deny-root-console --do-console-only-adm --do-autologoff --do-disable-wait-online
+#   3. You can specify any subset of steps.
 #
 # EXAMPLES:
-#   sudo bash smart-hardening.sh --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop"
-#   sudo bash smart-hardening.sh --user admin --pubkey-file /tmp/id_ed25519.pub --tmout 900 --disable-wait-online no
-#   sudo bash smart-hardening.sh --user bob --pubkey "ssh-rsa AAAAB3Nza..."
+#   sudo bash smart-hardening.sh --user alice --pubkey "ssh-ed25519 AAAAC3Nza..." --do-ensure-user --do-install-ssh-key --do-ssh-harden
+#   sudo bash smart-hardening.sh --user admin --pubkey-file /tmp/id_ed25519.pub --do-ensure-user --do-passwordless-sudo --do-autologoff
 #
 # SAFETY:
-#   - No actions will be performed unless --user and --pubkey/--pubkey-file are provided.
+#   - No actions will be performed unless the corresponding --do-* flag is provided.
 #   - The script is idempotent (safe to re-run).
 #   - Always keep a backup SSH session open when testing.
 #
@@ -34,27 +31,24 @@
 
 set -euo pipefail
 
-ADM_USER="adm-01"
-TMOUT_SECONDS="600"   # 10 minutes
-DISABLE_WAIT_ONLINE="yes"  # set to "no" if you want to keep wait-online
-
+ADM_USER=""
+TMOUT_SECONDS="600"
+DISABLE_WAIT_ONLINE="yes"
 PUBKEY=""
 PUBKEY_FILE=""
 YES_FLAG="no"
 DRY_RUN="no"
 
-# Skip flags for each step
-SKIP_ENSURE_USER="no"
-SKIP_PASSWORDLESS_SUDO="no"
-SKIP_INSTALL_SSH_KEY="no"
-SKIP_SSH_HARDEN="no"
-SKIP_DENY_ROOT_CONSOLE="no"
-SKIP_CONSOLE_ONLY_ADM="no"
-SKIP_AUTOLOGOFF="no"
-SKIP_DISABLE_WAIT_ONLINE="no"
+# Step flags (all default to no)
+DO_ENSURE_USER="no"
+DO_PASSWORDLESS_SUDO="no"
+DO_INSTALL_SSH_KEY="no"
+DO_SSH_HARDEN="no"
+DO_DENY_ROOT_CONSOLE="no"
+DO_CONSOLE_ONLY_ADM="no"
+DO_AUTOLOGOFF="no"
+DO_DISABLE_WAIT_ONLINE="no"
 
-log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-die(){ printf "ERROR: %s\n" "$*" >&2; exit 1; }
 info() { printf "[INFO] %s\n" "$*"; }
 success() { printf "[OK] %s\n" "$*"; }
 warning() { printf "[WARN] %s\n" "$*"; }
@@ -80,27 +74,16 @@ log_banner() {
 
 print_summary() {
   echo
-  echo "This script will perform the following actions (unless already applied):"
-  echo " - Harden SSH (disable password/root login, enable key auth)"
-  echo " - Deny root console login"
-  echo " - Restrict console login to $ADM_USER only"
-  echo " - Enable auto-logout for idle shells (${TMOUT_SECONDS}s)"
-  echo " - Optionally disable systemd-networkd-wait-online"
+  echo "This script will perform the following actions (only those explicitly requested):"
+  [[ "$DO_ENSURE_USER" == "yes" ]] && echo " - Create/ensure user: $ADM_USER"
+  [[ "$DO_PASSWORDLESS_SUDO" == "yes" ]] && echo " - Configure passwordless sudo for $ADM_USER"
+  [[ "$DO_INSTALL_SSH_KEY" == "yes" ]] && echo " - Install SSH public key for $ADM_USER"
+  [[ "$DO_SSH_HARDEN" == "yes" ]] && echo " - Harden SSH configuration"
+  [[ "$DO_DENY_ROOT_CONSOLE" == "yes" ]] && echo " - Deny root console login"
+  [[ "$DO_CONSOLE_ONLY_ADM" == "yes" ]] && echo " - Restrict console login to $ADM_USER only"
+  [[ "$DO_AUTOLOGOFF" == "yes" ]] && echo " - Enable auto-logout for idle shells (${TMOUT_SECONDS}s)"
+  [[ "$DO_DISABLE_WAIT_ONLINE" == "yes" ]] && echo " - Disable systemd-networkd-wait-online"
   echo
-  echo "User creation and SSH key setup are currently DISABLED."
-  echo
-}
-
-confirm_or_exit() {
-  if [[ "$YES_FLAG" == "yes" ]]; then
-    return
-  fi
-  echo -n "Continue with these changes? [y/N]: "
-  read -r ans
-  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-    echo "Aborted by user."
-    exit 1
-  fi
 }
 
 # Add --dry-run option
@@ -122,49 +105,51 @@ parse_args() {
         YES_FLAG="yes"; shift;;
       --dry-run)
         DRY_RUN="yes"; shift;;
-      --skip-ensure-user)
-        SKIP_ENSURE_USER="yes"; shift;;
-      --skip-passwordless-sudo)
-        SKIP_PASSWORDLESS_SUDO="yes"; shift;;
-      --skip-install-ssh-key)
-        SKIP_INSTALL_SSH_KEY="yes"; shift;;
-      --skip-ssh-harden)
-        SKIP_SSH_HARDEN="yes"; shift;;
-      --skip-deny-root-console)
-        SKIP_DENY_ROOT_CONSOLE="yes"; shift;;
-      --skip-console-only-adm)
-        SKIP_CONSOLE_ONLY_ADM="yes"; shift;;
-      --skip-autologoff)
-        SKIP_AUTOLOGOFF="yes"; shift;;
-      --skip-disable-wait-online)
-        SKIP_DISABLE_WAIT_ONLINE="yes"; shift;;
+      --do-ensure-user)
+        DO_ENSURE_USER="yes"; shift;;
+      --do-passwordless-sudo)
+        DO_PASSWORDLESS_SUDO="yes"; shift;;
+      --do-install-ssh-key)
+        DO_INSTALL_SSH_KEY="yes"; shift;;
+      --do-ssh-harden)
+        DO_SSH_HARDEN="yes"; shift;;
+      --do-deny-root-console)
+        DO_DENY_ROOT_CONSOLE="yes"; shift;;
+      --do-console-only-adm)
+        DO_CONSOLE_ONLY_ADM="yes"; shift;;
+      --do-autologoff)
+        DO_AUTOLOGOFF="yes"; shift;;
+      --do-disable-wait-online)
+        DO_DISABLE_WAIT_ONLINE="yes"; shift;;
       -h|--help)
         cat <<EOF
 Usage:
-  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [options]
-  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [options]
+  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA..." [--do-ensure-user ...] [options]
+  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--do-ensure-user ...] [options]
 
 Options:
   --user <username>                Admin username to configure (required)
-  --pubkey <key>                   SSH public key string (required)
+  --pubkey <key>                   SSH public key string (required for SSH key step)
   --pubkey-file <file>             Path to SSH public key file (alternative to --pubkey)
   --tmout <seconds>                Idle logout for console shells (default: 600)
   --disable-wait-online yes|no     Disable systemd-networkd-wait-online (default: yes)
   --yes                            Skip confirmation prompt
   --dry-run                        Show what would be done, but make no changes
-  --skip-ensure-user               Skip user creation/ensure step
-  --skip-passwordless-sudo         Skip passwordless sudo configuration
-  --skip-install-ssh-key           Skip SSH key installation
-  --skip-ssh-harden                Skip SSH hardening
-  --skip-deny-root-console         Skip denying root console login
-  --skip-console-only-adm          Skip restricting console login to admin user
-  --skip-autologoff                Skip enabling auto-logoff for idle shells
-  --skip-disable-wait-online       Skip disabling systemd-networkd-wait-online
+
+  --do-ensure-user                 Create/ensure the admin user
+  --do-passwordless-sudo           Configure passwordless sudo for the user
+  --do-install-ssh-key             Install SSH public key for the user
+  --do-ssh-harden                  Harden SSH configuration
+  --do-deny-root-console           Deny root console login
+  --do-console-only-adm            Restrict console login to admin user
+  --do-autologoff                  Enable auto-logout for idle shells
+  --do-disable-wait-online         Disable systemd-networkd-wait-online
+
   -h, --help                       Show this help and exit
 
 Examples:
-  sudo bash $0 --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop" --skip-autologoff
-  sudo bash $0 --user admin --pubkey-file /tmp/id_ed25519.pub --skip-ssh-harden --skip-disable-wait-online
+  sudo bash $0 --user alice --pubkey "ssh-ed25519 AAAAC3Nza..." --do-ensure-user --do-install-ssh-key --do-ssh-harden
+  sudo bash $0 --user admin --pubkey-file /tmp/id_ed25519.pub --do-ensure-user --do-passwordless-sudo --do-autologoff
 EOF
         exit 0;;
       *)
@@ -175,19 +160,24 @@ EOF
     [[ -f "$PUBKEY_FILE" ]] || die "Public key file not found: $PUBKEY_FILE"
     PUBKEY="$(cat "$PUBKEY_FILE")"
   fi
-  if [[ "$user_set" != "yes" || "$key_set" != "yes" ]]; then
-    echo "\n[ERROR] You must provide --user and --pubkey or --pubkey-file."
-    echo "See usage below:"
+  if [[ -z "$ADM_USER" ]]; then
+    echo "\n[ERROR] You must provide --user <username>."
     "$0" --help
     exit 1
   fi
-  if [[ -z "$PUBKEY" ]]; then
-    die "No SSH public key provided."
-  elif [[ ! "$PUBKEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; then
+  if [[ "$DO_INSTALL_SSH_KEY" == "yes" && -z "$PUBKEY" ]]; then
+    echo "\n[ERROR] --do-install-ssh-key requires --pubkey or --pubkey-file."
+    "$0" --help
+    exit 1
+  fi
+  if [[ -n "$PUBKEY" && ! "$PUBKEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; then
     die "PUBKEY does not look like an SSH public key"
   fi
-  if [[ -z "$ADM_USER" ]]; then
-    die "--user <username> is required."
+  # Require at least one --do-* flag
+  if [[ "$DO_ENSURE_USER" != "yes" && "$DO_PASSWORDLESS_SUDO" != "yes" && "$DO_INSTALL_SSH_KEY" != "yes" && "$DO_SSH_HARDEN" != "yes" && "$DO_DENY_ROOT_CONSOLE" != "yes" && "$DO_CONSOLE_ONLY_ADM" != "yes" && "$DO_AUTOLOGOFF" != "yes" && "$DO_DISABLE_WAIT_ONLINE" != "yes" ]]; then
+    echo "\n[ERROR] You must specify at least one --do-* flag to perform any action."
+    "$0" --help
+    exit 1
   fi
 }
 
@@ -328,13 +318,39 @@ parse_args "$@"
 log_banner "SMART HARDENING SCRIPT"
 print_summary
 confirm_or_exit
-ensure_user
-configure_passwordless_sudo
-install_ssh_key
-set_sshd_config
-set_tmout
-disable_wait_online
-
-echo
-echo "All tasks completed successfully."
-echo "Reboot the system to apply all changes."
+local step=1
+if [[ "$DO_ENSURE_USER" == "yes" ]]; then
+  info "[$step] Ensuring user and group setup..."; ((step++))
+  ensure_user
+fi
+if [[ "$DO_PASSWORDLESS_SUDO" == "yes" ]]; then
+  info "[$step] Configuring passwordless sudo..."; ((step++))
+  configure_passwordless_sudo
+fi
+if [[ "$DO_INSTALL_SSH_KEY" == "yes" ]]; then
+  info "[$step] Installing SSH key..."; ((step++))
+  install_ssh_key
+fi
+if [[ "$DO_SSH_HARDEN" == "yes" ]]; then
+  info "[$step] Hardening SSH configuration..."; ((step++))
+  set_sshd_config
+fi
+if [[ "$DO_DENY_ROOT_CONSOLE" == "yes" ]]; then
+  info "[$step] Denying root console login..."; ((step++))
+  smart_deny_root_console_login
+fi
+if [[ "$DO_CONSOLE_ONLY_ADM" == "yes" ]]; then
+  info "[$step] Restricting console login to $ADM_USER..."; ((step++))
+  smart_configure_console_only_adm01
+fi
+if [[ "$DO_AUTOLOGOFF" == "yes" ]]; then
+  info "[$step] Enabling auto-logout for idle shells..."; ((step++))
+  set_tmout
+fi
+if [[ "$DO_DISABLE_WAIT_ONLINE" == "yes" ]]; then
+  info "[$step] Disabling systemd-networkd-wait-online if needed..."; ((step++))
+  disable_wait_online
+fi
+final_checks
+log_banner "All done! Please test your access before closing your session."
+echo "If you are locked out, use your backup session or recovery console."
