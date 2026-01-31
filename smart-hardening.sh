@@ -25,9 +25,14 @@ DISABLE_WAIT_ONLINE="yes"  # set to "no" if you want to keep wait-online
 PUBKEY=""
 PUBKEY_FILE=""
 YES_FLAG="no"
+DRY_RUN="no"
 
 log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die(){ printf "ERROR: %s\n" "$*" >&2; exit 1; }
+info() { printf "[INFO] %s\n" "$*"; }
+success() { printf "[OK] %s\n" "$*"; }
+warning() { printf "[WARN] %s\n" "$*"; }
+critical() { printf "[FAIL] %s\n" "$*"; exit 1; }
 
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0 ..."
@@ -72,6 +77,7 @@ confirm_or_exit() {
   fi
 }
 
+# Add --dry-run option
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -87,17 +93,20 @@ parse_args() {
         DISABLE_WAIT_ONLINE="${2:-}"; shift 2;;
       --yes)
         YES_FLAG="yes"; shift;;
+      --dry-run)
+        DRY_RUN="yes"; shift;;
       -h|--help)
         cat <<EOF
 Usage:
-  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [--yes]
-  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--yes]
+  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [--yes] [--dry-run]
+  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--yes] [--dry-run]
 
 Options:
   --user <username>                Admin username to configure (default: adm-01)
   --tmout <seconds>                Idle logout for console shells (default: 600)
   --disable-wait-online yes|no     Disable systemd-networkd-wait-online (default: yes)
   --yes                            Skip confirmation prompt
+  --dry-run                        Show what would be done, but make no changes
   -h, --help                       Show this help and exit
 EOF
         exit 0;;
@@ -120,50 +129,73 @@ EOF
   fi
 }
 
+run_or_echo() {
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] $*"
+  else
+    eval "$*"
+  fi
+}
+
 ensure_user() {
   if id -u "$ADM_USER" >/dev/null 2>&1; then
-    log "User exists: $ADM_USER"
+    success "User exists: $ADM_USER"
   else
-    log "Creating user: $ADM_USER"
-    adduser --disabled-password --gecos "" "$ADM_USER"
+    info "Creating user: $ADM_USER"
+    if ! run_or_echo "adduser --disabled-password --gecos '' '$ADM_USER'"; then
+      warning "Failed to create user $ADM_USER. Skipping user creation."
+      return 1
+    fi
   fi
-
-  log "Ensuring $ADM_USER is in sudo group"
-  usermod -aG sudo "$ADM_USER"
+  info "Ensuring $ADM_USER is in sudo group"
+  if ! run_or_echo "usermod -aG sudo '$ADM_USER'"; then
+    warning "Failed to add $ADM_USER to sudo group."
+    return 1
+  fi
+  success "User $ADM_USER ensured and in sudo group."
 }
 
 configure_passwordless_sudo() {
   local f="/etc/sudoers.d/${ADM_USER}"
   if [[ -f "$f" ]] && grep -qE "^\s*${ADM_USER}\s+ALL=\(ALL\)\s+NOPASSWD:ALL\s*$" "$f"; then
-    log "Passwordless sudo already configured: $f"
+    success "Passwordless sudo already configured: $f"
     return 0
   fi
-
-  log "Configuring passwordless sudo: $f"
+  info "Configuring passwordless sudo: $f"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would write passwordless sudo for $ADM_USER to $f"
+    return 0
+  fi
   cat >"$f" <<EOF
 ${ADM_USER} ALL=(ALL) NOPASSWD:ALL
 EOF
   chmod 0440 "$f"
-  visudo -cf "$f" >/dev/null
+  if ! visudo -cf "$f" >/dev/null; then
+    warning "visudo check failed for $f."
+    return 1
+  fi
+  success "Passwordless sudo configured for $ADM_USER."
 }
 
 install_ssh_key() {
   local home_dir
   home_dir="$(getent passwd "$ADM_USER" | cut -d: -f6)"
-  [[ -n "$home_dir" ]] || die "Cannot determine home for $ADM_USER"
-
-  log "Installing SSH key for $ADM_USER"
+  [[ -n "$home_dir" ]] || { warning "Cannot determine home for $ADM_USER"; return 1; }
+  info "Installing SSH key for $ADM_USER"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would install SSH key for $ADM_USER in $home_dir/.ssh/authorized_keys"
+    return 0
+  fi
   install -d -m 0700 -o "$ADM_USER" -g "$ADM_USER" "${home_dir}/.ssh"
   local ak="${home_dir}/.ssh/authorized_keys"
   touch "$ak"
   chown "$ADM_USER:$ADM_USER" "$ak"
   chmod 0600 "$ak"
-
   if grep -Fqx "$PUBKEY" "$ak"; then
-    log "Public key already present in authorized_keys"
+    success "Public key already present in authorized_keys"
   else
     printf "%s\n" "$PUBKEY" >>"$ak"
-    log "Public key appended to authorized_keys"
+    success "Public key appended to authorized_keys"
   fi
 }
 
@@ -266,20 +298,16 @@ optional_disable_wait_online() {
 }
 
 final_checks() {
-  log "Final checks"
-  log "User groups:"
-  id "$ADM_USER" || true
-
-  log "Sudo rule check:"
-  sudo -l -U "$ADM_USER" | sed -n '1,120p' || true
-
-  log "SSH effective settings (subset):"
-  sshd -T 2>/dev/null | grep -E 'passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|usepam' || true
-
-  log "Console restriction file tail:"
-  tail -n 30 /etc/security/access.conf || true
-
-  log "Done. Test in a NEW session:"
+  info "Final checks"
+  info "User groups:"
+  id "$ADM_USER" || warning "User $ADM_USER does not exist."
+  info "Sudo rule check:"
+  sudo -l -U "$ADM_USER" | sed -n '1,120p' || warning "Sudo check failed for $ADM_USER."
+  info "SSH effective settings (subset):"
+  sshd -T 2>/dev/null | grep -E 'passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|usepam' || warning "Could not get sshd settings."
+  info "Console restriction file tail:"
+  tail -n 30 /etc/security/access.conf || warning "Could not read /etc/security/access.conf."
+  info "Done. Test in a NEW session:"
   cat <<EOF
 1) SSH key login:
    ssh ${ADM_USER}@<server>
@@ -323,32 +351,43 @@ smart_configure_ssh_hardening() {
   grep -q '^PubkeyAuthentication yes' "$f" || needed=1
   grep -q '^UsePAM yes' "$f" || needed=1
   if [ "$needed" -eq 0 ]; then
-    log "SSH config already hardened."
+    success "SSH config already hardened."
+    return
+  fi
+  info "Hardening SSH (no passwords; no root login)"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would update $f for SSH hardening."
     return
   fi
   backup_file "$f"
-  log "Hardening SSH (no passwords; no root login)"
   set_sshd_kv "PasswordAuthentication" "no"
   set_sshd_kv "KbdInteractiveAuthentication" "no"
   set_sshd_kv "ChallengeResponseAuthentication" "no"
   set_sshd_kv "PermitRootLogin" "no"
   set_sshd_kv "PubkeyAuthentication" "yes"
   set_sshd_kv "UsePAM" "yes"
-  sshd -t || die "sshd_config validation failed. Fix /etc/ssh/sshd_config."
+  if ! sshd -t; then
+    critical "sshd_config validation failed. Fix /etc/ssh/sshd_config."
+  fi
   systemctl reload ssh || systemctl reload sshd
-  log "SSH reloaded"
+  success "SSH reloaded and hardened."
 }
 
 # Smart deny root console login
 smart_deny_root_console_login() {
   local f="/etc/securetty"
   if [ ! -s "$f" ]; then
-    log "Root console login already denied."
+    success "Root console login already denied."
+    return
+  fi
+  info "Denying root login on console (empty /etc/securetty)"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would empty $f to deny root console login."
     return
   fi
   backup_file "$f"
-  log "Denying root login on console (empty /etc/securetty)"
   : >"$f"
+  success "Root console login denied."
 }
 
 # Smart restrict console login to adm-01
@@ -356,11 +395,15 @@ smart_configure_console_only_adm01() {
   ensure_pam_access_enabled
   local f="/etc/security/access.conf"
   if grep -q "^# BEGIN ADM01_CONSOLE_ONLY$" "$f" && grep -q "^# END ADM01_CONSOLE_ONLY$" "$f" && grep -q "+ : $ADM_USER : LOCAL" "$f"; then
-    log "Console login restriction already set for $ADM_USER."
+    success "Console login restriction already set for $ADM_USER."
+    return
+  fi
+  info "Restricting console login: allow $ADM_USER only; deny everyone else (LOCAL)"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would update $f for console login restriction."
     return
   fi
   backup_file "$f"
-  log "Restricting console login: allow $ADM_USER only; deny everyone else (LOCAL)"
   sed -i '/^# BEGIN ADM01_CONSOLE_ONLY$/,/^# END ADM01_CONSOLE_ONLY$/d' "$f" || true
   cat >>"$f" <<EOF
 
@@ -371,16 +414,21 @@ smart_configure_console_only_adm01() {
 - : ALL : LOCAL
 # END ADM01_CONSOLE_ONLY
 EOF
+  success "Console login restriction applied."
 }
 
 # Smart auto-logout idle shells
 smart_configure_console_autologoff_tmout() {
   local f="/etc/profile.d/00-autologout.sh"
   if [ -f "$f" ] && grep -q "TMOUT=${TMOUT_SECONDS}" "$f"; then
-    log "Auto-logoff already set to ${TMOUT_SECONDS}s."
+    success "Auto-logoff already set to ${TMOUT_SECONDS}s."
     return
   fi
-  log "Configuring console idle auto-logoff (TMOUT=${TMOUT_SECONDS}s): $f"
+  info "Configuring console idle auto-logoff (TMOUT=${TMOUT_SECONDS}s): $f"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "[DRY-RUN] Would update $f for auto-logoff."
+    return
+  fi
   cat >"$f" <<EOF
 # Auto-logout idle interactive shells (console/tty) after ${TMOUT_SECONDS}s.
 # Applies to bash/sh for interactive shells.
@@ -393,18 +441,24 @@ case "\$-" in
 esac
 EOF
   chmod 0644 "$f"
+  success "Auto-logoff set to ${TMOUT_SECONDS}s."
 }
 
 # Smart optionally disable systemd-networkd-wait-online
 smart_optional_disable_wait_online() {
   if [[ "$DISABLE_WAIT_ONLINE" == "yes" ]]; then
     if ! systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null | grep -q 'enabled'; then
-      log "systemd-networkd-wait-online already disabled."
+      success "systemd-networkd-wait-online already disabled."
       return
     fi
-    log "Disabling systemd-networkd-wait-online to avoid boot hangs"
-    systemctl disable --now systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+    info "Disabling systemd-networkd-wait-online to avoid boot hangs"
+    if [[ "$DRY_RUN" == "yes" ]]; then
+      echo "[DRY-RUN] Would disable systemd-networkd-wait-online.service."
+      return
+    fi
+    systemctl disable --now systemd-networkd-wait-online.service >/dev/null 2>&1 || warning "Failed to disable systemd-networkd-wait-online.service."
+    success "systemd-networkd-wait-online disabled."
   else
-    log "Leaving systemd-networkd-wait-online enabled"
+    info "Leaving systemd-networkd-wait-online enabled"
   fi
 }
