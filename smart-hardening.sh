@@ -43,6 +43,16 @@ PUBKEY_FILE=""
 YES_FLAG="no"
 DRY_RUN="no"
 
+# Skip flags for each step
+SKIP_ENSURE_USER="no"
+SKIP_PASSWORDLESS_SUDO="no"
+SKIP_INSTALL_SSH_KEY="no"
+SKIP_SSH_HARDEN="no"
+SKIP_DENY_ROOT_CONSOLE="no"
+SKIP_CONSOLE_ONLY_ADM="no"
+SKIP_AUTOLOGOFF="no"
+SKIP_DISABLE_WAIT_ONLINE="no"
+
 log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die(){ printf "ERROR: %s\n" "$*" >&2; exit 1; }
 info() { printf "[INFO] %s\n" "$*"; }
@@ -112,11 +122,27 @@ parse_args() {
         YES_FLAG="yes"; shift;;
       --dry-run)
         DRY_RUN="yes"; shift;;
+      --skip-ensure-user)
+        SKIP_ENSURE_USER="yes"; shift;;
+      --skip-passwordless-sudo)
+        SKIP_PASSWORDLESS_SUDO="yes"; shift;;
+      --skip-install-ssh-key)
+        SKIP_INSTALL_SSH_KEY="yes"; shift;;
+      --skip-ssh-harden)
+        SKIP_SSH_HARDEN="yes"; shift;;
+      --skip-deny-root-console)
+        SKIP_DENY_ROOT_CONSOLE="yes"; shift;;
+      --skip-console-only-adm)
+        SKIP_CONSOLE_ONLY_ADM="yes"; shift;;
+      --skip-autologoff)
+        SKIP_AUTOLOGOFF="yes"; shift;;
+      --skip-disable-wait-online)
+        SKIP_DISABLE_WAIT_ONLINE="yes"; shift;;
       -h|--help)
         cat <<EOF
 Usage:
-  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [--yes] [--dry-run]
-  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--yes] [--dry-run]
+  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [options]
+  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [options]
 
 Options:
   --user <username>                Admin username to configure (required)
@@ -126,11 +152,19 @@ Options:
   --disable-wait-online yes|no     Disable systemd-networkd-wait-online (default: yes)
   --yes                            Skip confirmation prompt
   --dry-run                        Show what would be done, but make no changes
+  --skip-ensure-user               Skip user creation/ensure step
+  --skip-passwordless-sudo         Skip passwordless sudo configuration
+  --skip-install-ssh-key           Skip SSH key installation
+  --skip-ssh-harden                Skip SSH hardening
+  --skip-deny-root-console         Skip denying root console login
+  --skip-console-only-adm          Skip restricting console login to admin user
+  --skip-autologoff                Skip enabling auto-logoff for idle shells
+  --skip-disable-wait-online       Skip disabling systemd-networkd-wait-online
   -h, --help                       Show this help and exit
 
 Examples:
-  sudo bash $0 --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop"
-  sudo bash $0 --user admin --pubkey-file /tmp/id_ed25519.pub --tmout 900 --disable-wait-online no
+  sudo bash $0 --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop" --skip-autologoff
+  sudo bash $0 --user admin --pubkey-file /tmp/id_ed25519.pub --skip-ssh-harden --skip-disable-wait-online
 EOF
         exit 0;;
       *)
