@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
 # smart-hardening.sh (Ubuntu 22.04)
-# - Create/ensure user adm-01 with passwordless sudo
-# - Install SSH public key for adm-01
-# - Disable SSH password auth; disable root SSH
-# - Deny console login for root
-# - Allow console login ONLY for adm-01 (PAM access)
-# - Auto-logoff idle console shells for all users (TMOUT)
-# - Optional: disable systemd-networkd-wait-online to prevent boot hang
 #
-# Usage:
-#   sudo bash smart-hardening.sh --pubkey "ssh-ed25519 AAAA... comment"
-#   sudo bash smart-hardening.sh --pubkey-file /path/to/id_ed25519.pub
+# WHAT THIS SCRIPT DOES:
+#   - Creates or ensures an admin user (default: adm-01, configurable)
+#   - Installs an SSH public key for that user
+#   - Configures passwordless sudo for the user
+#   - Hardens SSH: disables password/root login, enables key auth
+#   - Denies root console login
+#   - Restricts console login to the admin user only
+#   - Enables auto-logoff for idle shells (default: 10 min, configurable)
+#   - Optionally disables systemd-networkd-wait-online to prevent boot hang
 #
-# Notes:
-# - Keep an active SSH session while testing; do not lock yourself out.
-# - Script is idempotent (safe to re-run).
+# HOW TO USE:
+#   1. Prepare your SSH public key (e.g., id_ed25519.pub)
+#   2. Run as root with explicit parameters:
+#      sudo bash smart-hardening.sh --user <username> --pubkey "ssh-ed25519 AAAA... comment"
+#      OR
+#      sudo bash smart-hardening.sh --user <username> --pubkey-file /path/to/key.pub
+#   3. Review the summary and confirm when prompted.
+#
+# EXAMPLES:
+#   sudo bash smart-hardening.sh --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop"
+#   sudo bash smart-hardening.sh --user admin --pubkey-file /tmp/id_ed25519.pub --tmout 900 --disable-wait-online no
+#   sudo bash smart-hardening.sh --user bob --pubkey "ssh-rsa AAAAB3Nza..."
+#
+# SAFETY:
+#   - No actions will be performed unless --user and --pubkey/--pubkey-file are provided.
+#   - The script is idempotent (safe to re-run).
+#   - Always keep a backup SSH session open when testing.
+#
+# For help:
+#   sudo bash smart-hardening.sh --help
 
 set -euo pipefail
 
@@ -79,14 +95,15 @@ confirm_or_exit() {
 
 # Add --dry-run option
 parse_args() {
+  local user_set="no" key_set="no"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user)
-        ADM_USER="${2:-}"; shift 2;;
+        ADM_USER="${2:-}"; user_set="yes"; shift 2;;
       --pubkey)
-        PUBKEY="${2:-}"; shift 2;;
+        PUBKEY="${2:-}"; key_set="yes"; shift 2;;
       --pubkey-file)
-        PUBKEY_FILE="${2:-}"; shift 2;;
+        PUBKEY_FILE="${2:-}"; key_set="yes"; shift 2;;
       --tmout)
         TMOUT_SECONDS="${2:-}"; shift 2;;
       --disable-wait-online)
@@ -102,25 +119,36 @@ Usage:
   sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--yes] [--dry-run]
 
 Options:
-  --user <username>                Admin username to configure (default: adm-01)
+  --user <username>                Admin username to configure (required)
+  --pubkey <key>                   SSH public key string (required)
+  --pubkey-file <file>             Path to SSH public key file (alternative to --pubkey)
   --tmout <seconds>                Idle logout for console shells (default: 600)
   --disable-wait-online yes|no     Disable systemd-networkd-wait-online (default: yes)
   --yes                            Skip confirmation prompt
   --dry-run                        Show what would be done, but make no changes
   -h, --help                       Show this help and exit
+
+Examples:
+  sudo bash $0 --user alice --pubkey "ssh-ed25519 AAAAC3Nza... alice@laptop"
+  sudo bash $0 --user admin --pubkey-file /tmp/id_ed25519.pub --tmout 900 --disable-wait-online no
 EOF
         exit 0;;
       *)
         die "Unknown arg: $1";;
     esac
   done
-
   if [[ -n "$PUBKEY_FILE" ]]; then
     [[ -f "$PUBKEY_FILE" ]] || die "Public key file not found: $PUBKEY_FILE"
     PUBKEY="$(cat "$PUBKEY_FILE")"
   fi
+  if [[ "$user_set" != "yes" || "$key_set" != "yes" ]]; then
+    echo "\n[ERROR] You must provide --user and --pubkey or --pubkey-file."
+    echo "See usage below:"
+    "$0" --help
+    exit 1
+  fi
   if [[ -z "$PUBKEY" ]]; then
-    log "No SSH public key provided. User setup is skipped."
+    die "No SSH public key provided."
   elif [[ ! "$PUBKEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; then
     die "PUBKEY does not look like an SSH public key"
   fi
@@ -199,4 +227,80 @@ install_ssh_key() {
   fi
 }
 
-set_ssd
+set_sshd_config() {
+  local f="/etc/ssh/sshd_config"
+  backup_file "$f"
+  info "Hardening SSH configuration: $f"
+  {
+    echo "Match User $ADM_USER"
+    echo "  AllowTcpForwarding no"
+    echo "  X11Forwarding no"
+    echo "  PermitTTY yes"
+    echo "  ForceCommand internal-sftp"
+    echo
+    echo "Match Address 192.168.1.*"
+    echo "  AllowTcpForwarding yes"
+    echo "  X11Forwarding yes"
+    echo "  PermitTTY yes"
+    echo "  ForceCommand /bin/bash"
+    echo
+    echo "Match all"
+    echo "  PasswordAuthentication no"
+    echo "  ChallengeResponseAuthentication no"
+    echo "  UsePAM no"
+    echo "  PermitRootLogin no"
+    echo "  PubkeyAuthentication yes"
+    echo "  AuthorizedKeysFile .ssh/authorized_keys"
+    echo "  PermitEmptyPasswords no"
+    echo "  AllowUsers $ADM_USER"
+  } >>"$f"
+  if ! sshd -t; then
+    critical "SSH configuration test failed. Fix issues before proceeding."
+  fi
+  success "SSH configuration hardened."
+}
+
+set_tmout() {
+  local f="/etc/profile.d/tmout.sh"
+  backup_file "$f"
+  info "Setting up auto-logoff for idle shells: $f"
+  cat >"$f" <<EOF
+# Auto-logoff for idle shells
+TMOUT=${TMOUT_SECONDS}
+readonly TMOUT
+export TMOUT
+EOF
+  chmod 0644 "$f"
+  success "Auto-logoff configured."
+}
+
+disable_wait_online() {
+  local s="/etc/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service"
+  if [[ "$DISABLE_WAIT_ONLINE" == "yes" ]]; then
+    info "Disabling systemd-networkd-wait-online.service"
+    run_or_echo "systemctl disable systemd-networkd-wait-online.service"
+    run_or_echo "systemctl stop systemd-networkd-wait-online.service"
+    success "systemd-networkd-wait-online.service disabled."
+  else
+    info "Enabling systemd-networkd-wait-online.service"
+    run_or_echo "systemctl enable systemd-networkd-wait-online.service"
+    success "systemd-networkd-wait-online.service enabled."
+  fi
+}
+
+# Main script execution
+require_root
+parse_args "$@"
+log_banner "SMART HARDENING SCRIPT"
+print_summary
+confirm_or_exit
+ensure_user
+configure_passwordless_sudo
+install_ssh_key
+set_sshd_config
+set_tmout
+disable_wait_online
+
+echo
+echo "All tasks completed successfully."
+echo "Reboot the system to apply all changes."
