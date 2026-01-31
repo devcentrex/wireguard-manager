@@ -24,6 +24,7 @@ DISABLE_WAIT_ONLINE="yes"  # set to "no" if you want to keep wait-online
 
 PUBKEY=""
 PUBKEY_FILE=""
+YES_FLAG="no"
 
 log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die(){ printf "ERROR: %s\n" "$*" >&2; exit 1; }
@@ -40,9 +41,42 @@ backup_file() {
   log "Backup: $f -> $b"
 }
 
+log_banner() {
+  echo "=================================================="
+  echo "$1"
+  echo "=================================================="
+}
+
+print_summary() {
+  echo
+  echo "This script will perform the following actions (unless already applied):"
+  echo " - Harden SSH (disable password/root login, enable key auth)"
+  echo " - Deny root console login"
+  echo " - Restrict console login to $ADM_USER only"
+  echo " - Enable auto-logout for idle shells (${TMOUT_SECONDS}s)"
+  echo " - Optionally disable systemd-networkd-wait-online"
+  echo
+  echo "User creation and SSH key setup are currently DISABLED."
+  echo
+}
+
+confirm_or_exit() {
+  if [[ "$YES_FLAG" == "yes" ]]; then
+    return
+  fi
+  echo -n "Continue with these changes? [y/N]: "
+  read -r ans
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    echo "Aborted by user."
+    exit 1
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --user)
+        ADM_USER="${2:-}"; shift 2;;
       --pubkey)
         PUBKEY="${2:-}"; shift 2;;
       --pubkey-file)
@@ -51,15 +85,20 @@ parse_args() {
         TMOUT_SECONDS="${2:-}"; shift 2;;
       --disable-wait-online)
         DISABLE_WAIT_ONLINE="${2:-}"; shift 2;;
+      --yes)
+        YES_FLAG="yes"; shift;;
       -h|--help)
         cat <<EOF
 Usage:
-  sudo bash $0 --pubkey "ssh-ed25519 AAAA... comment"
-  sudo bash $0 --pubkey-file /path/to/key.pub
+  sudo bash $0 --user <username> --pubkey "ssh-ed25519 AAAA... comment" [--yes]
+  sudo bash $0 --user <username> --pubkey-file /path/to/key.pub [--yes]
 
 Options:
-  --tmout <seconds>               Idle logout for console shells (default: 600)
-  --disable-wait-online yes|no    Disable systemd-networkd-wait-online (default: yes)
+  --user <username>                Admin username to configure (default: adm-01)
+  --tmout <seconds>                Idle logout for console shells (default: 600)
+  --disable-wait-online yes|no     Disable systemd-networkd-wait-online (default: yes)
+  --yes                            Skip confirmation prompt
+  -h, --help                       Show this help and exit
 EOF
         exit 0;;
       *)
@@ -71,8 +110,14 @@ EOF
     [[ -f "$PUBKEY_FILE" ]] || die "Public key file not found: $PUBKEY_FILE"
     PUBKEY="$(cat "$PUBKEY_FILE")"
   fi
-  [[ -n "$PUBKEY" ]] || die "Provide --pubkey or --pubkey-file"
-  [[ "$PUBKEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]] || die "PUBKEY does not look like an SSH public key"
+  if [[ -z "$PUBKEY" ]]; then
+    log "No SSH public key provided. User setup is skipped."
+  elif [[ ! "$PUBKEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; then
+    die "PUBKEY does not look like an SSH public key"
+  fi
+  if [[ -z "$ADM_USER" ]]; then
+    die "--user <username> is required."
+  fi
 }
 
 ensure_user() {
@@ -180,14 +225,14 @@ configure_console_only_adm01() {
 
   # Remove any previous block we manage, then append fresh
   # Markers keep it idempotent and easy to edit/remove.
-  log "Restricting console login: allow ${ADM_USER} only; deny everyone else (LOCAL)"
+  log "Restricting console login: allow $ADM_USER only; deny everyone else (LOCAL)"
   sed -i '/^# BEGIN ADM01_CONSOLE_ONLY$/,/^# END ADM01_CONSOLE_ONLY$/d' "$f" || true
 
   cat >>"$f" <<EOF
 
 # BEGIN ADM01_CONSOLE_ONLY
-# Allow adm-01 on local console
-+ : ${ADM_USER} : LOCAL
+# Allow $ADM_USER on local console
++ : $ADM_USER : LOCAL
 # Deny everyone else on console
 - : ALL : LOCAL
 # END ADM01_CONSOLE_ONLY
@@ -249,17 +294,22 @@ EOF
 }
 
 main() {
+  log_banner "WireGuard Smart Hardening Script (User-Friendly Mode)"
   require_root
   parse_args "$@"
-  # ensure_user
-  # configure_passwordless_sudo
-  # install_ssh_key
+  print_summary
+  confirm_or_exit
+  ensure_user
+  configure_passwordless_sudo
+  install_ssh_key
   smart_configure_ssh_hardening
   smart_deny_root_console_login
   smart_configure_console_only_adm01
   smart_configure_console_autologoff_tmout
   smart_optional_disable_wait_online
   final_checks
+  log_banner "All done! Please test your access before closing your session."
+  echo "If you are locked out, use your backup session or recovery console."
 }
 
 # Smart SSH hardening: only change if needed
@@ -305,18 +355,18 @@ smart_deny_root_console_login() {
 smart_configure_console_only_adm01() {
   ensure_pam_access_enabled
   local f="/etc/security/access.conf"
-  if grep -q "^# BEGIN ADM01_CONSOLE_ONLY$" "$f" && grep -q "^# END ADM01_CONSOLE_ONLY$" "$f"; then
-    log "Console login restriction already set for ${ADM_USER}."
+  if grep -q "^# BEGIN ADM01_CONSOLE_ONLY$" "$f" && grep -q "^# END ADM01_CONSOLE_ONLY$" "$f" && grep -q "+ : $ADM_USER : LOCAL" "$f"; then
+    log "Console login restriction already set for $ADM_USER."
     return
   fi
   backup_file "$f"
-  log "Restricting console login: allow ${ADM_USER} only; deny everyone else (LOCAL)"
+  log "Restricting console login: allow $ADM_USER only; deny everyone else (LOCAL)"
   sed -i '/^# BEGIN ADM01_CONSOLE_ONLY$/,/^# END ADM01_CONSOLE_ONLY$/d' "$f" || true
   cat >>"$f" <<EOF
 
 # BEGIN ADM01_CONSOLE_ONLY
-# Allow adm-01 on local console
-+ : ${ADM_USER} : LOCAL
+# Allow $ADM_USER on local console
++ : $ADM_USER : LOCAL
 # Deny everyone else on console
 - : ALL : LOCAL
 # END ADM01_CONSOLE_ONLY
