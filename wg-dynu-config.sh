@@ -1,127 +1,200 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Dynu DDNS updater via IP Update Protocol + systemd timer (every 5 minutes)
-# Stores only SHA-256 hash of the IP update password on disk.
-# Uses server-side IP detection (no myip parameter).
+# Configure Dynu IP Update Client (Linux) via /usr/share/dynu-ip-update-client/appsettings.json
+# - Derives Group from FQDN using only [a-zA-Z0-9]
+# - Stores only MD5Password (Password left empty)
+# - PollInterval=300 (5 min)
+# - ConnectionType=DETECTIPONSERVERSIDE (auto-detect public IP)
 #
-# Vendor refs:
-# - IP Update Protocol endpoint and hashed password support: https://www.dynu.com/DynamicDNS/IP-Update-Protocol
-# - cURL notes: https://www.dynu.com/DynamicDNS/IPUpdateClient/cURL
+# Ref: https://www.dynu.com/DynamicDNS/IPUpdateClient/Linux
+
+APPSETTINGS_PATH="/usr/share/dynu-ip-update-client/appsettings.json"
+SERVICE_NAME="dynu-ip-update-client.service"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo ./dynu-client-configure-appsettings.sh --username USER --hostname FQDN [--password PASS] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
+
+Options:
+  --username    Dynu account username
+  --hostname    FQDN you want to update (used to derive Group)
+  --password    Dynu IP update password. If omitted, you will be prompted securely.
+  --ipv6        Default: false
+  --loglevel    Default: DETAILED
+  -h, --help    Show help
+
+Example:
+  sudo ./dynu-client-configure-appsettings.sh --username webtester --hostname vmx-msk-vpn-04.ddnsfree.com
+EOF
+}
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "ERROR: run as root. Example: sudo $0"
+    echo "ERROR: run as root."
     exit 1
   fi
 }
 
 require_tools() {
   local missing=0
-  for t in curl sha256sum install systemctl; do
+  for t in md5sum systemctl date; do
     if ! command -v "$t" >/dev/null 2>&1; then
-      echo "ERROR: missing required tool: $t"
+      echo "ERROR: missing tool: $t"
       missing=1
     fi
   done
   if [[ $missing -ne 0 ]]; then
-    echo "Install missing tools, then re-run."
     exit 1
   fi
 }
 
-read_inputs() {
-  local u h p
-  read -r -p "Dynu username: " u
-  read -r -p "Hostname to update (FQDN): " h
-  read -r -s -p "Dynu IP-update password (will be hashed, not stored in cleartext): " p
-  echo
+validate_inputs() {
+  if [[ -z "${DYNU_USERNAME:-}" ]]; then
+    echo "ERROR: --username is required"
+    exit 1
+  fi
+  if [[ -z "${DYNU_HOSTNAME:-}" ]]; then
+    echo "ERROR: --hostname is required"
+    exit 1
+  fi
+  if [[ "${DYNU_HOSTNAME}" =~ [[:space:]] ]]; then
+    echo "ERROR: hostname contains whitespace"
+    exit 1
+  fi
+  if [[ "${DYNU_HOSTNAME}" != *.* ]]; then
+    echo "ERROR: hostname does not look like an FQDN"
+    exit 1
+  fi
+  if [[ "${DYNU_IPV6}" != "true" && "${DYNU_IPV6}" != "false" ]]; then
+    echo "ERROR: --ipv6 must be true or false"
+    exit 1
+  fi
+  if [[ "${DYNU_LOGLEVEL}" != "DETAILED" && "${DYNU_LOGLEVEL}" != "NORMAL" ]]; then
+    echo "ERROR: --loglevel must be DETAILED or NORMAL"
+    exit 1
+  fi
+}
 
-  if [[ -z "$u" || -z "$h" || -z "$p" ]]; then
-    echo "ERROR: username, hostname, and password are required."
+prompt_password_if_needed() {
+  if [[ -z "${DYNU_PASSWORD:-}" ]]; then
+    read -r -s -p "Dynu IP-update password (stored as MD5 only): " DYNU_PASSWORD
+    echo
+  fi
+  if [[ -z "${DYNU_PASSWORD}" ]]; then
+    echo "ERROR: password is required"
+    exit 1
+  fi
+}
+
+derive_group_from_hostname() {
+  # Only allow [a-zA-Z0-9], as requested.
+  # 1) Remove all non-alphanumerics
+  # 2) If empty -> "DYNU"
+  # 3) Truncate to 32 chars to avoid silly-length group names
+  local cleaned
+  cleaned="$(printf '%s' "${DYNU_HOSTNAME}" | tr -cd '[:alnum:]')"
+  if [[ -z "$cleaned" ]]; then
+    cleaned="DYNU"
+  fi
+  GROUP_NAME="${cleaned:0:32}"
+}
+
+backup_existing() {
+  if [[ -f "${APPSETTINGS_PATH}" ]]; then
+    local ts
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a "${APPSETTINGS_PATH}" "${APPSETTINGS_PATH}.bak.${ts}"
+  fi
+}
+
+write_appsettings() {
+  if [[ ! -d "$(dirname "${APPSETTINGS_PATH}")" ]]; then
+    echo "ERROR: directory does not exist: $(dirname "${APPSETTINGS_PATH}")"
+    echo "Install the Dynu client package first."
     exit 1
   fi
 
-  DYNU_USERNAME="$u"
-  DYNU_HOSTNAME="$h"
-  DYNU_PASS_SHA256="$(printf '%s' "$p" | sha256sum | awk '{print $1}')"
+  local md5
+  md5="$(printf '%s' "${DYNU_PASSWORD}" | md5sum | awk '{print $1}')"
+
+  cat > "${APPSETTINGS_PATH}" <<EOF
+{
+  "Settings": {
+    "Username": "${DYNU_USERNAME}",
+    "Password": "",
+    "MD5Password": "${md5}",
+    "Group": "${GROUP_NAME}",
+    "PollInterval": 300,
+    "Logging": "true",
+    "LogLevel": "${DYNU_LOGLEVEL}",
+    "IPv4": "true",
+    "IPv6": "${DYNU_IPV6}",
+    "ConnectionType": "DETECTIPONSERVERSIDE",
+    "SpecifiedIPv4Address": "",
+    "SpecifiedIPv6Address": "",
+    "SpecifiedMACID": ""
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.Hosting.Lifetime": "Information"
+    }
+  }
+}
+EOF
+
+  chmod 0600 "${APPSETTINGS_PATH}"
 }
 
-write_config() {
-  install -d -m 0755 /etc/dynu
-  cat > /etc/dynu/dynu-ddns.conf <<EOF
-# Dynu DDNS updater config (hash-only)
-DYNU_ENDPOINT="https://api.dynu.com/nic/update"
-DYNU_USERNAME="${DYNU_USERNAME}"
-DYNU_HOSTNAME="${DYNU_HOSTNAME}"
-DYNU_PASSWORD_SHA256="${DYNU_PASS_SHA256}"
-EOF
-  chmod 0600 /etc/dynu/dynu-ddns.conf
-}
-
-write_updater() {
-  cat > /usr/local/sbin/dynu-ddns-update.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Load config
-# shellcheck disable=SC1091
-. /etc/dynu/dynu-ddns.conf
-
-# Server-side IP detection: do NOT pass myip.
-# Dynu documentation notes to wrap URL in double quotes so params are sent fully by curl.
-resp="$(curl --silent --show-error --fail \
-  "${DYNU_ENDPOINT}?hostname=${DYNU_HOSTNAME}&username=${DYNU_USERNAME}&password=${DYNU_PASSWORD_SHA256}")"
-
-ts="$(date -Is)"
-echo "${ts} dynu-ddns: ${resp}"
-EOF
-  chmod 0755 /usr/local/sbin/dynu-ddns-update.sh
-}
-
-write_systemd_units() {
-  cat > /etc/systemd/system/dynu-ddns-update.service <<'EOF'
-[Unit]
-Description=Dynu DDNS update (explicit hostname) via IP Update Protocol
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/dynu-ddns-update.sh
-EOF
-
-  cat > /etc/systemd/system/dynu-ddns-update.timer <<'EOF'
-[Unit]
-Description=Run Dynu DDNS update every 5 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
+enable_restart_service() {
   systemctl daemon-reload
-  systemctl enable --now dynu-ddns-update.timer
+  systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl restart "${SERVICE_NAME}"
 }
 
 main() {
+  DYNU_USERNAME=""
+  DYNU_HOSTNAME=""
+  DYNU_PASSWORD=""
+  DYNU_IPV6="false"
+  DYNU_LOGLEVEL="DETAILED"
+  GROUP_NAME=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --username) DYNU_USERNAME="${2:-}"; shift 2 ;;
+      --hostname) DYNU_HOSTNAME="${2:-}"; shift 2 ;;
+      --password) DYNU_PASSWORD="${2:-}"; shift 2 ;;
+      --ipv6) DYNU_IPV6="${2:-}"; shift 2 ;;
+      --loglevel) DYNU_LOGLEVEL="${2:-}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "ERROR: unknown argument: $1"; usage; exit 1 ;;
+    esac
+  done
+
   require_root
   require_tools
-  read_inputs
-  write_config
-  write_updater
-  write_systemd_units
+  validate_inputs
+  prompt_password_if_needed
+  derive_group_from_hostname
+  backup_existing
+  write_appsettings
+  enable_restart_service
 
-  echo "OK: configured Dynu DDNS updates."
-  echo "Config file: /etc/dynu/dynu-ddns.conf (0600, SHA-256 hash only)"
-  echo "Timer: dynu-ddns-update.timer (every 5 minutes)"
-  echo "Check timer: systemctl status dynu-ddns-update.timer"
-  echo "View logs: journalctl -u dynu-ddns-update.service --no-pager -n 50"
-  echo "Run once now: /usr/local/sbin/dynu-ddns-update.sh"
+  echo "OK: Dynu client configured."
+  echo "1. appsettings: ${APPSETTINGS_PATH}"
+  echo "2. Hostname requested: ${DYNU_HOSTNAME}"
+  echo "3. Derived Group: ${GROUP_NAME}"
+  echo "4. PollInterval: 300 seconds"
+  echo "5. ConnectionType: DETECTIPONSERVERSIDE"
+  echo
+  echo "IMPORTANT:"
+  echo "Create a Dynu group named '${GROUP_NAME}' in Dynu Control Panel and assign '${DYNU_HOSTNAME}' to it."
+  echo
+  echo "Status: systemctl status ${SERVICE_NAME} -l"
+  echo "Logs:   journalctl -u ${SERVICE_NAME} --no-pager -n 100"
 }
 
 main "$@"
