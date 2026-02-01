@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Configure Dynu IP Update Client (Linux) via /usr/share/dynu-ip-update-client/appsettings.json
-# - Derives Group from FQDN using only [a-zA-Z0-9]
+# - Derives Group from FQDN using only [a-z A-Z 0-9]
 # - Stores only MD5Password (Password left empty)
 # - PollInterval=300 (5 min)
 # - ConnectionType=DETECTIPONSERVERSIDE (auto-detect public IP)
@@ -15,7 +15,7 @@ SERVICE_NAME="dynu-ip-update-client.service"
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./dynu-client-configure-appsettings.sh --username USER --hostname FQDN [--password PASS] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
+  sudo ./wg-dynu-config.sh --username USER --hostname FQDN [--password PASS] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
 
 Options:
   --username    Dynu account username
@@ -24,9 +24,6 @@ Options:
   --ipv6        Default: false
   --loglevel    Default: DETAILED
   -h, --help    Show help
-
-Example:
-  sudo ./dynu-client-configure-appsettings.sh --username dynu --hostname host.domain.com --password mypass
 EOF
 }
 
