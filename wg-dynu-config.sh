@@ -26,7 +26,7 @@ Options:
   -h, --help    Show help
 
 Example:
-  sudo ./dynu-client-configure-appsettings.sh --username webtester --hostname vmx-msk-vpn-04.ddnsfree.com
+  sudo ./dynu-client-configure-appsettings.sh --username dynu --hostname host.domain.com --password mypass
 EOF
 }
 
