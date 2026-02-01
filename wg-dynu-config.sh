@@ -12,9 +12,9 @@ set -euo pipefail
 # Behavior:
 # - Updates hostnames via Dynu "Group" selection (Linux client uses Group, not a direct hostname field).
 # - We derive a Dynu Group name from the provided FQDN using only [a-zA-Z0-9].
-# - PollInterval is fixed at 300 seconds (5 minutes).
 # - ConnectionType is DETECTIPONSERVERSIDE (Dynu detects external IP automatically).
 # - Stores only MD5Password in appsettings.json; Password is left empty.
+# - PollInterval is configurable (seconds).
 #
 # IMPORTANT:
 # You must create a Dynu Group with the derived name in Dynu Control Panel
@@ -29,30 +29,31 @@ usage() {
 wg-dynu-config.sh - configure Dynu Linux IP Update Client (appsettings.json)
 
 Usage:
-  sudo ./wg-dynu-config.sh --hostname vpn.example.net [--username dynu] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
+  sudo ./wg-dynu-config.sh --hostname vpn.example.net [--username dynu] [--poll-interval 300] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
   Password options (choose exactly one):
     1. --md5 <md5hash>          Use provided MD5 hash directly (32 hex chars).
     2. --password <plaintext>   Plaintext password is accepted via CLI and converted to MD5.
     3. (no password flag)       Script will prompt securely and convert to MD5.
 
 Options:
-  --hostname    FQDN you want to update (required). Used to derive Group.
-  --username    Dynu account username. Default: dynu
-  --md5         Password MD5 hash (32 hex chars).
-  --password    Plaintext password (will be hashed to MD5; NOT stored in cleartext).
-  --ipv6        true or false. Default: false
-  --loglevel    DETAILED or NORMAL. Default: DETAILED
-  -h, --help    Show help
+  --hostname        FQDN you want to update (required). Used to derive Group.
+  --username        Dynu account username. Default: dynu
+  --poll-interval   Poll interval in seconds. Default: 300
+  --md5             Password MD5 hash (32 hex chars).
+  --password        Plaintext password (will be hashed to MD5; NOT stored in cleartext).
+  --ipv6            true or false. Default: false
+  --loglevel        DETAILED or NORMAL. Default: DETAILED
+  -h, --help        Show help
 
 Examples:
   1) Provide MD5 directly:
-     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --md5 4bc372104b580fc150727e51eca1b674
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300 --md5 4bc372104b580fc150727e51eca1b674
 
   2) Provide plaintext via CLI (script derives MD5):
-     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --password 'YourSecret'
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300 --password 'YourSecret'
 
-  3) Prompt for password (script derives MD5):
-     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net
+  3) Prompt for password (script derives MD5) and set 5 minutes:
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300
 EOF
 }
 
@@ -76,6 +77,10 @@ require_tools() {
   fi
 }
 
+is_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 validate_inputs() {
   if [[ -z "${DYNU_HOSTNAME:-}" ]]; then
     echo "ERROR: --hostname is required"
@@ -95,6 +100,14 @@ validate_inputs() {
   fi
   if [[ "${DYNU_LOGLEVEL}" != "DETAILED" && "${DYNU_LOGLEVEL}" != "NORMAL" ]]; then
     echo "ERROR: --loglevel must be DETAILED or NORMAL"
+    exit 1
+  fi
+  if ! is_uint "${DYNU_POLL_INTERVAL}"; then
+    echo "ERROR: --poll-interval must be an integer number of seconds"
+    exit 1
+  fi
+  if [[ "${DYNU_POLL_INTERVAL}" -lt 60 ]]; then
+    echo "ERROR: --poll-interval must be at least 60 seconds"
     exit 1
   fi
 }
@@ -185,7 +198,7 @@ write_appsettings() {
     "Password": "",
     "MD5Password": "${DYNU_MD5_PASSWORD}",
     "Group": "${GROUP_NAME}",
-    "PollInterval": 300,
+    "PollInterval": ${DYNU_POLL_INTERVAL},
     "Logging": "true",
     "LogLevel": "${DYNU_LOGLEVEL}",
     "IPv4": "true",
@@ -216,6 +229,7 @@ enable_restart_service() {
 main() {
   DYNU_USERNAME="dynu"
   DYNU_HOSTNAME=""
+  DYNU_POLL_INTERVAL="300"
   DYNU_IPV6="false"
   DYNU_LOGLEVEL="DETAILED"
 
@@ -228,6 +242,7 @@ main() {
     case "$1" in
       --username) DYNU_USERNAME="${2:-}"; shift 2 ;;
       --hostname) DYNU_HOSTNAME="${2:-}"; shift 2 ;;
+      --poll-interval) DYNU_POLL_INTERVAL="${2:-}"; shift 2 ;;
       --md5) DYNU_MD5="${2:-}"; shift 2 ;;
       --password) DYNU_PASSWORD="${2:-}"; shift 2 ;;
       --ipv6) DYNU_IPV6="${2:-}"; shift 2 ;;
@@ -250,7 +265,7 @@ main() {
   echo "1. appsettings: ${APPSETTINGS_PATH}"
   echo "2. Hostname requested: ${DYNU_HOSTNAME}"
   echo "3. Derived Group: ${GROUP_NAME}"
-  echo "4. PollInterval: 300 seconds"
+  echo "4. PollInterval: ${DYNU_POLL_INTERVAL} seconds"
   echo "5. ConnectionType: DETECTIPONSERVERSIDE"
   echo
   echo "IMPORTANT:"
