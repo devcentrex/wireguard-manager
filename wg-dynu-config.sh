@@ -10,16 +10,17 @@ set -euo pipefail
 #   https://www.dynu.com/DynamicDNS/IPUpdateClient/Linux
 #
 # Behavior:
-# - Updates hostnames via Dynu "Group" selection (Linux client uses Group, not a direct hostname field).
-# - We derive a Dynu Group name from the provided FQDN using only [a-zA-Z0-9].
-# - ConnectionType is DETECTIPONSERVERSIDE (Dynu detects external IP automatically).
-# - Stores only MD5Password in appsettings.json; Password is left empty.
-# - PollInterval is configurable (seconds).
+# . Updates hostnames via Dynu "Group" selection (Linux client uses Group, not a direct hostname field).
+# . Group name is derived from the HOSTNAME label only (not the full FQDN), using only [a-zA-Z0-9].
+#   Example: vpn.example.net -> hostname label "vpn" -> group "vpn"
+# . ConnectionType is DETECTIPONSERVERSIDE (Dynu detects external IP automatically).
+# . Stores only MD5Password in appsettings.json. Password is left empty.
+# . PollInterval is configurable in seconds.
 #
 # IMPORTANT:
-# You must create a Dynu Group with the derived name in Dynu Control Panel
-# and assign your hostname (FQDN) to that group. Then the Linux client will
-# update only hostnames in that group.
+# . You must create a Dynu Group with the derived name in Dynu Control Panel
+#   and assign your FQDN to that group. Then the Linux client will update only
+#   hostnames in that group.
 
 APPSETTINGS_PATH="/usr/share/dynu-ip-update-client/appsettings.json"
 SERVICE_NAME="dynu-ip-update-client.service"
@@ -36,23 +37,23 @@ Usage:
     3. (no password flag)       Script will prompt securely and convert to MD5.
 
 Options:
-  --hostname        FQDN you want to update (required). Used to derive Group.
+  --hostname        FQDN you want to update (required). Group is derived from the HOSTNAME label only.
   --username        Dynu account username. Default: dynu
   --poll-interval   Poll interval in seconds. Default: 300
   --md5             Password MD5 hash (32 hex chars).
-  --password        Plaintext password (will be hashed to MD5; NOT stored in cleartext).
+  --password        Plaintext password (will be hashed to MD5. Not stored in cleartext).
   --ipv6            true or false. Default: false
   --loglevel        DETAILED or NORMAL. Default: DETAILED
   -h, --help        Show help
 
 Examples:
-  1) Provide MD5 directly:
+  1. Provide MD5 directly:
      sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300 --md5 4bc372104b580fc150727e51eca1b674
 
-  2) Provide plaintext via CLI (script derives MD5):
+  2. Provide plaintext via CLI (script derives MD5):
      sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300 --password 'YourSecret'
 
-  3) Prompt for password (script derives MD5) and set 5 minutes:
+  3. Prompt for password (script derives MD5) and set 5 minutes:
      sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --poll-interval 300
 EOF
 }
@@ -112,14 +113,16 @@ validate_inputs() {
   fi
 }
 
-derive_group_from_hostname() {
+derive_group_from_hostname_label() {
   # Group supports only [a-zA-Z0-9]
-  # Derivation:
-  # - Strip all non-alphanumeric
-  # - If empty -> DYNU
-  # - Truncate to 32 chars to keep names reasonable
+  # Derivation source is HOSTNAME label only:
+  # . Take substring before first dot: vpn.example.net -> vpn
+  # . Strip all non-alphanumeric
+  # . If empty -> DYNU
+  # . Truncate to 32 chars
+  HOST_LABEL="${DYNU_HOSTNAME%%.*}"
   local cleaned
-  cleaned="$(printf '%s' "${DYNU_HOSTNAME}" | tr -cd '[:alnum:]')"
+  cleaned="$(printf '%s' "${HOST_LABEL}" | tr -cd '[:alnum:]')"
   if [[ -z "$cleaned" ]]; then
     cleaned="DYNU"
   fi
@@ -132,9 +135,9 @@ is_valid_md5() {
 
 resolve_md5_password() {
   # Supports exactly one of:
-  # - --md5
-  # - --password
-  # - prompt
+  # . --md5
+  # . --password
+  # . prompt
   local has_md5="false"
   local has_pw="false"
 
@@ -155,7 +158,7 @@ resolve_md5_password() {
       echo "ERROR: --md5 must be exactly 32 hex characters"
       exit 1
     fi
-    DYNU_MD5_PASSWORD="${DYNU_MD5,,}"  # normalize to lowercase
+    DYNU_MD5_PASSWORD="${DYNU_MD5,,}"
     return
   fi
 
@@ -164,7 +167,6 @@ resolve_md5_password() {
     return
   fi
 
-  # Prompt securely
   local p1
   read -r -s -p "Dynu IP-update password (will be stored as MD5 only): " p1
   echo
@@ -190,7 +192,6 @@ write_appsettings() {
     exit 1
   fi
 
-  # JSON schema matches Dynu Linux documentation example.
   cat > "${APPSETTINGS_PATH}" <<EOF
 {
   "Settings": {
@@ -236,6 +237,7 @@ main() {
   DYNU_MD5=""
   DYNU_PASSWORD=""
   DYNU_MD5_PASSWORD=""
+  HOST_LABEL=""
   GROUP_NAME=""
 
   while [[ $# -gt 0 ]]; do
@@ -255,7 +257,7 @@ main() {
   require_root
   require_tools
   validate_inputs
-  derive_group_from_hostname
+  derive_group_from_hostname_label
   resolve_md5_password
   backup_existing
   write_appsettings
@@ -263,14 +265,15 @@ main() {
 
   echo "OK: Dynu Linux client configured."
   echo "1. appsettings: ${APPSETTINGS_PATH}"
-  echo "2. Hostname requested: ${DYNU_HOSTNAME}"
-  echo "3. Derived Group: ${GROUP_NAME}"
-  echo "4. PollInterval: ${DYNU_POLL_INTERVAL} seconds"
-  echo "5. ConnectionType: DETECTIPONSERVERSIDE"
+  echo "2. FQDN requested: ${DYNU_HOSTNAME}"
+  echo "3. Hostname label used: ${HOST_LABEL}"
+  echo "4. Derived Group: ${GROUP_NAME}"
+  echo "5. PollInterval: ${DYNU_POLL_INTERVAL} seconds"
+  echo "6. ConnectionType: DETECTIPONSERVERSIDE"
   echo
   echo "IMPORTANT:"
   echo "1. In Dynu Control Panel, create a group named '${GROUP_NAME}'."
-  echo "2. Assign hostname '${DYNU_HOSTNAME}' to that group."
+  echo "2. Assign FQDN '${DYNU_HOSTNAME}' to that group."
   echo
   echo "Service:"
   echo "1. Status: systemctl status ${SERVICE_NAME} -l"
