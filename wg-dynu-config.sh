@@ -1,42 +1,71 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Configure Dynu IP Update Client (Linux) via /usr/share/dynu-ip-update-client/appsettings.json
-# - Derives Group from FQDN using only [a-z A-Z 0-9]
-# - Stores only MD5Password (Password left empty)
-# - PollInterval=300 (5 min)
-# - ConnectionType=DETECTIPONSERVERSIDE (auto-detect public IP)
+# wg-dynu-config.sh
 #
-# Ref: https://www.dynu.com/DynamicDNS/IPUpdateClient/Linux
+# Configure Dynu IP Update Client (Linux) by writing:
+#   /usr/share/dynu-ip-update-client/appsettings.json
+#
+# Vendor reference:
+#   https://www.dynu.com/DynamicDNS/IPUpdateClient/Linux
+#
+# Behavior:
+# - Updates hostnames via Dynu "Group" selection (Linux client uses Group, not a direct hostname field).
+# - We derive a Dynu Group name from the provided FQDN using only [a-zA-Z0-9].
+# - PollInterval is fixed at 300 seconds (5 minutes).
+# - ConnectionType is DETECTIPONSERVERSIDE (Dynu detects external IP automatically).
+# - Stores only MD5Password in appsettings.json; Password is left empty.
+#
+# IMPORTANT:
+# You must create a Dynu Group with the derived name in Dynu Control Panel
+# and assign your hostname (FQDN) to that group. Then the Linux client will
+# update only hostnames in that group.
 
 APPSETTINGS_PATH="/usr/share/dynu-ip-update-client/appsettings.json"
 SERVICE_NAME="dynu-ip-update-client.service"
 
 usage() {
   cat <<'EOF'
+wg-dynu-config.sh - configure Dynu Linux IP Update Client (appsettings.json)
+
 Usage:
-  sudo ./wg-dynu-config.sh --username USER --hostname FQDN [--password PASS] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
+  sudo ./wg-dynu-config.sh --hostname vpn.example.net [--username dynu] [--ipv6 true|false] [--loglevel DETAILED|NORMAL]
+  Password options (choose exactly one):
+    1. --md5 <md5hash>          Use provided MD5 hash directly (32 hex chars).
+    2. --password <plaintext>   Plaintext password is accepted via CLI and converted to MD5.
+    3. (no password flag)       Script will prompt securely and convert to MD5.
 
 Options:
-  --username    Dynu account username
-  --hostname    FQDN you want to update (used to derive Group)
-  --password    Dynu IP update password. If omitted, you will be prompted securely.
-  --ipv6        Default: false
-  --loglevel    Default: DETAILED
+  --hostname    FQDN you want to update (required). Used to derive Group.
+  --username    Dynu account username. Default: dynu
+  --md5         Password MD5 hash (32 hex chars).
+  --password    Plaintext password (will be hashed to MD5; NOT stored in cleartext).
+  --ipv6        true or false. Default: false
+  --loglevel    DETAILED or NORMAL. Default: DETAILED
   -h, --help    Show help
+
+Examples:
+  1) Provide MD5 directly:
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --md5 4bc372104b580fc150727e51eca1b674
+
+  2) Provide plaintext via CLI (script derives MD5):
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net --password 'YourSecret'
+
+  3) Prompt for password (script derives MD5):
+     sudo ./wg-dynu-config.sh --username dynu --hostname vpn.example.net
 EOF
 }
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "ERROR: run as root."
+    echo "ERROR: run as root. Example: sudo $0 ..."
     exit 1
   fi
 }
 
 require_tools() {
   local missing=0
-  for t in md5sum systemctl date; do
+  for t in md5sum systemctl date tr awk; do
     if ! command -v "$t" >/dev/null 2>&1; then
       echo "ERROR: missing tool: $t"
       missing=1
@@ -48,10 +77,6 @@ require_tools() {
 }
 
 validate_inputs() {
-  if [[ -z "${DYNU_USERNAME:-}" ]]; then
-    echo "ERROR: --username is required"
-    exit 1
-  fi
   if [[ -z "${DYNU_HOSTNAME:-}" ]]; then
     echo "ERROR: --hostname is required"
     exit 1
@@ -74,28 +99,67 @@ validate_inputs() {
   fi
 }
 
-prompt_password_if_needed() {
-  if [[ -z "${DYNU_PASSWORD:-}" ]]; then
-    read -r -s -p "Dynu IP-update password (stored as MD5 only): " DYNU_PASSWORD
-    echo
-  fi
-  if [[ -z "${DYNU_PASSWORD}" ]]; then
-    echo "ERROR: password is required"
-    exit 1
-  fi
-}
-
 derive_group_from_hostname() {
-  # Only allow [a-zA-Z0-9], as requested.
-  # 1) Remove all non-alphanumerics
-  # 2) If empty -> "DYNU"
-  # 3) Truncate to 32 chars to avoid silly-length group names
+  # Group supports only [a-zA-Z0-9]
+  # Derivation:
+  # - Strip all non-alphanumeric
+  # - If empty -> DYNU
+  # - Truncate to 32 chars to keep names reasonable
   local cleaned
   cleaned="$(printf '%s' "${DYNU_HOSTNAME}" | tr -cd '[:alnum:]')"
   if [[ -z "$cleaned" ]]; then
     cleaned="DYNU"
   fi
   GROUP_NAME="${cleaned:0:32}"
+}
+
+is_valid_md5() {
+  [[ "$1" =~ ^[a-fA-F0-9]{32}$ ]]
+}
+
+resolve_md5_password() {
+  # Supports exactly one of:
+  # - --md5
+  # - --password
+  # - prompt
+  local has_md5="false"
+  local has_pw="false"
+
+  if [[ -n "${DYNU_MD5:-}" ]]; then
+    has_md5="true"
+  fi
+  if [[ -n "${DYNU_PASSWORD:-}" ]]; then
+    has_pw="true"
+  fi
+
+  if [[ "$has_md5" == "true" && "$has_pw" == "true" ]]; then
+    echo "ERROR: use only one of --md5 or --password"
+    exit 1
+  fi
+
+  if [[ "$has_md5" == "true" ]]; then
+    if ! is_valid_md5 "${DYNU_MD5}"; then
+      echo "ERROR: --md5 must be exactly 32 hex characters"
+      exit 1
+    fi
+    DYNU_MD5_PASSWORD="${DYNU_MD5,,}"  # normalize to lowercase
+    return
+  fi
+
+  if [[ "$has_pw" == "true" ]]; then
+    DYNU_MD5_PASSWORD="$(printf '%s' "${DYNU_PASSWORD}" | md5sum | awk '{print $1}')"
+    return
+  fi
+
+  # Prompt securely
+  local p1
+  read -r -s -p "Dynu IP-update password (will be stored as MD5 only): " p1
+  echo
+  if [[ -z "$p1" ]]; then
+    echo "ERROR: password is required"
+    exit 1
+  fi
+  DYNU_MD5_PASSWORD="$(printf '%s' "$p1" | md5sum | awk '{print $1}')"
 }
 
 backup_existing() {
@@ -109,19 +173,17 @@ backup_existing() {
 write_appsettings() {
   if [[ ! -d "$(dirname "${APPSETTINGS_PATH}")" ]]; then
     echo "ERROR: directory does not exist: $(dirname "${APPSETTINGS_PATH}")"
-    echo "Install the Dynu client package first."
+    echo "Install Dynu client first (dynu-ip-update-client package)."
     exit 1
   fi
 
-  local md5
-  md5="$(printf '%s' "${DYNU_PASSWORD}" | md5sum | awk '{print $1}')"
-
+  # JSON schema matches Dynu Linux documentation example.
   cat > "${APPSETTINGS_PATH}" <<EOF
 {
   "Settings": {
     "Username": "${DYNU_USERNAME}",
     "Password": "",
-    "MD5Password": "${md5}",
+    "MD5Password": "${DYNU_MD5_PASSWORD}",
     "Group": "${GROUP_NAME}",
     "PollInterval": 300,
     "Logging": "true",
@@ -152,17 +214,21 @@ enable_restart_service() {
 }
 
 main() {
-  DYNU_USERNAME=""
+  DYNU_USERNAME="dynu"
   DYNU_HOSTNAME=""
-  DYNU_PASSWORD=""
   DYNU_IPV6="false"
   DYNU_LOGLEVEL="DETAILED"
+
+  DYNU_MD5=""
+  DYNU_PASSWORD=""
+  DYNU_MD5_PASSWORD=""
   GROUP_NAME=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --username) DYNU_USERNAME="${2:-}"; shift 2 ;;
       --hostname) DYNU_HOSTNAME="${2:-}"; shift 2 ;;
+      --md5) DYNU_MD5="${2:-}"; shift 2 ;;
       --password) DYNU_PASSWORD="${2:-}"; shift 2 ;;
       --ipv6) DYNU_IPV6="${2:-}"; shift 2 ;;
       --loglevel) DYNU_LOGLEVEL="${2:-}"; shift 2 ;;
@@ -174,13 +240,13 @@ main() {
   require_root
   require_tools
   validate_inputs
-  prompt_password_if_needed
   derive_group_from_hostname
+  resolve_md5_password
   backup_existing
   write_appsettings
   enable_restart_service
 
-  echo "OK: Dynu client configured."
+  echo "OK: Dynu Linux client configured."
   echo "1. appsettings: ${APPSETTINGS_PATH}"
   echo "2. Hostname requested: ${DYNU_HOSTNAME}"
   echo "3. Derived Group: ${GROUP_NAME}"
@@ -188,10 +254,12 @@ main() {
   echo "5. ConnectionType: DETECTIPONSERVERSIDE"
   echo
   echo "IMPORTANT:"
-  echo "Create a Dynu group named '${GROUP_NAME}' in Dynu Control Panel and assign '${DYNU_HOSTNAME}' to it."
+  echo "1. In Dynu Control Panel, create a group named '${GROUP_NAME}'."
+  echo "2. Assign hostname '${DYNU_HOSTNAME}' to that group."
   echo
-  echo "Status: systemctl status ${SERVICE_NAME} -l"
-  echo "Logs:   journalctl -u ${SERVICE_NAME} --no-pager -n 100"
+  echo "Service:"
+  echo "1. Status: systemctl status ${SERVICE_NAME} -l"
+  echo "2. Logs:   journalctl -u ${SERVICE_NAME} --no-pager -n 100"
 }
 
 main "$@"
