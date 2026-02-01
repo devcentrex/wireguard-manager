@@ -4,9 +4,9 @@ Two bash scripts for a simple WireGuard server on Ubuntu 20+, plus peer lifecycl
 
 Files
 . `wg-deploy.sh`  
-  Deploys a WireGuard server using `wg-quick`, enables IP forwarding, and sets up NAT internet breakout via `iptables` (MASQUERADE). Also writes defaults used for client config generation. :contentReference[oaicite:1]{index=1}
+  Deploys a WireGuard server using `wg-quick`, enables IP forwarding, and sets up NAT internet breakout via `iptables` (MASQUERADE). Also writes defaults used for client config generation. 
 . `wg-peers.sh`  
-  Adds, lists, shows, disables, enables, and revokes peers. Generates client configs or templates and can print QR codes for configs when the client private key is known. :contentReference[oaicite:2]{index=2}
+  Adds, lists, shows, disables, enables, and revokes peers. Generates client configs or templates and can print QR codes for configs when the client private key is known.
 
 ## Requirements
 
@@ -124,7 +124,7 @@ Outputs
 
 ### 3.2 BYO client keys, server knows only PublicKey
 
-Use this when the client already exists and you do not want the server to hold the client private key.
+Use this when the client already configured on remote side and you do not want the server to hold the client private key.
 
 ```bash
 sudo bash ./wg-peers.sh add phone1 \
